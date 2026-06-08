@@ -1,0 +1,347 @@
+"""
+WIQL Skill - Direct WIQL execution against Azure DevOps REST API.
+
+This skill provides:
+- run_wiql_query(): Execute WIQL queries directly via ADO REST API
+- Automatic date intent detection from natural language
+- Support for @Today, @StartOfDay macros
+- Full work item details retrieval
+
+Usage:
+    from agents.pm_agent.skills.wiql_skill import run_wiql_query
+    
+    result = await run_wiql_query(
+        project="FracPro-OPS",
+        wiql="SELECT [System.Id] FROM WorkItems WHERE ..."
+    )
+"""
+
+import json
+import logging
+import requests
+from typing import Dict, Any, List, Optional
+
+from utilities.wiql.builder import (
+    WIQLBuilder,
+    parse_query_for_date_intent,
+    build_wiql_from_intent,
+)
+
+logger = logging.getLogger(__name__)
+
+
+async def run_wiql_query(
+    project: str = None,
+    wiql: str = None,
+    top: int = 1000,
+    natural_language_query: str = None
+) -> Dict[str, Any]:
+    """
+    Execute WIQL query against Azure DevOps REST API.
+    
+    Can accept either:
+    1. Pre-built WIQL query string
+    2. Natural language query (auto-converted to WIQL)
+    
+    Args:
+        project: Azure DevOps project name
+        wiql: WIQL query string
+        top: Maximum results (default 1000)
+        natural_language_query: Optional - convert natural language to WIQL
+    
+    Returns:
+        Dict with:
+        - success: bool
+        - count: int
+        - items: List of work item dicts
+        - query: The executed WIQL query
+        - error: Error message if failed
+    
+    Example:
+        result = await run_wiql_query(
+            project="FracPro-OPS",
+            wiql="SELECT [System.Id] FROM WorkItems WHERE [System.WorkItemType] = 'Bug'"
+        )
+    """
+    from utilities.mcp.pat import get_pat
+    from config import config
+    
+    # Get ADO configuration
+    org_url = config.ado_org_url
+    pat = get_pat()
+    project = project or config.ado_project
+    
+    if not org_url or not pat:
+        logger.error("[WIQL_SKILL] ADO_ORG_URL or PAT not configured")
+        return {
+            "success": False,
+            "error": "ADO_ORG_URL or PAT not configured",
+            "count": 0,
+            "items": []
+        }
+    
+    # If natural language query provided, convert to WIQL
+    if natural_language_query and not wiql:
+        logger.info(f"[WIQL_SKILL] Converting natural language to WIQL: {natural_language_query}")
+        wiql = build_wiql_from_intent(natural_language_query, project)
+        
+        if not wiql:
+            logger.warning(f"[WIQL_SKILL] Could not parse date intent from query: {natural_language_query}")
+            return {
+                "success": False,
+                "error": f"Could not parse date/time filters from query: {natural_language_query}",
+                "count": 0,
+                "items": []
+            }
+    
+    if not wiql:
+        return {
+            "success": False,
+            "error": "No WIQL query provided",
+            "count": 0,
+            "items": []
+        }
+    
+    logger.info(f"[WIQL_SKILL] Executing WIQL for project={project}")
+    logger.debug(f"[WIQL_SKILL] Query:\n{wiql}")
+    
+    # Execute WIQL to get work item IDs
+    wiql_url = f"{org_url}/{project}/_apis/wit/wiql?api-version=7.0"
+    
+    # Always add $top to prevent VS402337 (>20K items exceeds ADO limit)
+    if top:
+        wiql_url += f"&$top={top}"
+    
+    headers = {"Content-Type": "application/json"}
+    
+    try:
+        # Execute WIQL query
+        resp = requests.post(
+            wiql_url,
+            auth=("", pat),
+            headers=headers,
+            json={"query": wiql},
+            timeout=60
+        )
+        resp.raise_for_status()
+        wiql_result = resp.json()
+        
+        work_item_refs = wiql_result.get("workItems", [])
+        
+        if not work_item_refs:
+            logger.info("[WIQL_SKILL] No work items found")
+            return {
+                "success": True,
+                "count": 0,
+                "items": [],
+                "query": wiql
+            }
+        
+        # Get work item IDs
+        ids = [wi.get("id") for wi in work_item_refs if wi.get("id")]
+        
+        # Limit to top N
+        if top and len(ids) > top:
+            ids = ids[:top]
+        
+        logger.info(f"[WIQL_SKILL] Found {len(ids)} work item IDs")
+        
+        # Fetch full work item details
+        items = await _fetch_work_item_details(org_url, pat, ids)
+        
+        return {
+            "success": True,
+            "count": len(items),
+            "items": items,
+            "query": wiql
+        }
+        
+    except requests.exceptions.HTTPError as e:
+        error_msg = f"WIQL query failed: {e}"
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                error_detail = e.response.json()
+                error_msg = f"WIQL error: {error_detail.get('message', str(e))}"
+            except:
+                error_msg = f"WIQL error: {e.response.text[:500]}"
+        logger.error(f"[WIQL_SKILL] {error_msg}")
+        return {
+            "success": False,
+            "error": error_msg,
+            "count": 0,
+            "items": [],
+            "query": wiql
+        }
+    except Exception as e:
+        logger.exception(f"[WIQL_SKILL] Unexpected error: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "count": 0,
+            "items": [],
+            "query": wiql
+        }
+
+
+async def _fetch_work_item_details(
+    org_url: str,
+    pat: str,
+    ids: List[int]
+) -> List[Dict[str, Any]]:
+    """
+    Fetch full work item details by IDs.
+    
+    Args:
+        org_url: Azure DevOps organization URL
+        pat: Personal Access Token
+        ids: List of work item IDs
+    
+    Returns:
+        List of work item dictionaries with all fields
+    """
+    if not ids:
+        return []
+    
+    # Fields to retrieve
+    fields = [
+        "System.Id",
+        "System.Title",
+        "System.State",
+        "System.WorkItemType",
+        "System.AreaPath",
+        "System.IterationPath",
+        "System.CreatedDate",
+        "System.ChangedDate",
+        "System.AssignedTo",
+        "System.Tags",
+        "System.Reason",
+        "Microsoft.VSTS.Common.ClosedDate",
+        "Microsoft.VSTS.Common.Priority",
+        "Microsoft.VSTS.Common.Severity"
+    ]
+    
+    work_items = []
+    
+    # Batch in groups of 200 (ADO limit)
+    batch_size = 200
+    for i in range(0, len(ids), batch_size):
+        batch = ids[i:i + batch_size]
+        ids_str = ",".join(str(x) for x in batch)
+        fields_str = ",".join(fields)
+        
+        url = f"{org_url}/_apis/wit/workitems?ids={ids_str}&fields={fields_str}&api-version=7.0"
+        
+        try:
+            resp = requests.get(url, auth=("", pat), timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+            
+            for wi in data.get("value", []):
+                # Flatten fields for easier access
+                flattened = {
+                    "id": wi.get("id"),
+                    "url": wi.get("url"),
+                    "rev": wi.get("rev"),
+                }
+                
+                fields_data = wi.get("fields", {})
+                for field_name, field_value in fields_data.items():
+                    # Simplify field names (remove System. prefix)
+                    simple_name = field_name.replace("System.", "").replace("Microsoft.VSTS.Common.", "")
+                    
+                    # Handle identity fields (AssignedTo, CreatedBy, etc.)
+                    if isinstance(field_value, dict) and "displayName" in field_value:
+                        flattened[simple_name] = field_value.get("displayName")
+                        flattened[f"{simple_name}_email"] = field_value.get("uniqueName")
+                    else:
+                        flattened[simple_name] = field_value
+                
+                # Also keep original fields structure
+                flattened["fields"] = fields_data
+                
+                work_items.append(flattened)
+                
+        except Exception as e:
+            logger.error(f"[WIQL_SKILL] Failed to fetch batch: {e}")
+    
+    logger.info(f"[WIQL_SKILL] Retrieved {len(work_items)} work items with details")
+    return work_items
+
+
+def build_query_for_closed_bugs(project: str, days_ago: int = 10) -> str:
+    """
+    Helper: Build WIQL for bugs closed in last N days.
+    
+    Args:
+        project: ADO project name
+        days_ago: Number of days to look back
+    
+    Returns:
+        WIQL query string
+    """
+    from config import config as _cfg
+    _completed = _cfg.get_states_for_category('completed')
+    return WIQLBuilder() \
+        .select() \
+        .where_project(project) \
+        .where_work_item_type('Bug') \
+        .where_state_in(_completed) \
+        .where_closed_date_range(days_ago=days_ago) \
+        .order_by('Microsoft.VSTS.Common.ClosedDate', desc=True) \
+        .build()
+
+
+def build_query_for_created_items(
+    project: str,
+    work_item_type: str = None,
+    days_ago: int = 7
+) -> str:
+    """
+    Helper: Build WIQL for items created in last N days.
+    
+    Args:
+        project: ADO project name
+        work_item_type: Optional work item type filter
+        days_ago: Number of days to look back
+    
+    Returns:
+        WIQL query string
+    """
+    builder = WIQLBuilder() \
+        .select() \
+        .where_project(project) \
+        .where_created_date_range(days_ago=days_ago) \
+        .order_by('System.CreatedDate', desc=True)
+    
+    if work_item_type:
+        builder.where_work_item_type(work_item_type)
+    
+    return builder.build()
+
+
+def build_query_for_changed_items(
+    project: str,
+    work_item_type: str = None,
+    days_ago: int = 7
+) -> str:
+    """
+    Helper: Build WIQL for items changed in last N days.
+    
+    Args:
+        project: ADO project name
+        work_item_type: Optional work item type filter
+        days_ago: Number of days to look back
+    
+    Returns:
+        WIQL query string
+    """
+    builder = WIQLBuilder() \
+        .select() \
+        .where_project(project) \
+        .where_changed_date_range(days_ago=days_ago) \
+        .order_by('System.ChangedDate', desc=True)
+    
+    if work_item_type:
+        builder.where_work_item_type(work_item_type)
+    
+    return builder.build()

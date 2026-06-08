@@ -1,0 +1,53 @@
+__pycache__/
+.early.coverage/
+*.csv
+.env*
+.env
+*.log
+*.pyc
+# Ignore env backups and shell files that may contain PATs
+.env.bak*
+.env.*
+\# Export the PAT in your shell.sh
+
+# Config file with secrets - use config.yaml.example as template
+config.yaml
+
+# Logs, previews and generated artifacts
+logs/
+*.json
+
+# Text files (if you want to ignore any generated .txt files)
+*.txt
+
+# Outputs and other generated reports
+outputs/
+
+# Ignore distribution/build artifacts
+dist/
+
+# Ignore stream/log files
+*stream*.log
+
+# Ignore any path that contains 'mcp' (catch discovery files and related artifacts)
+#*mcp*
+
+# Ignore user typo/readmine file if present
+readmine.md
+.venv/
+# outputs and logs
+outputs/
+logs/
+*.log
+streamlit.log
+# env & secrets
+.env
+.env.*
+
+# virtualenv / pycache
+.venv/
+__pycache__/
+*.pyc
+
+# Developer notes and non-production docs
+IMPROVEMENTS.md

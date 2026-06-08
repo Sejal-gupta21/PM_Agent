@@ -1,0 +1,7 @@
+config:
+  - name: builds/pms-agent
+    build:
+      - work-dir: .
+        dockerfile: Dockerfile
+        image-name: internal/pm-agent
+

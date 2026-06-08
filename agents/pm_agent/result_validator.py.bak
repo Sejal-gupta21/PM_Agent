@@ -1,0 +1,968 @@
+"""
+Tool Result Validator - Validates tool execution results before synthesis.
+
+This module provides comprehensive validation of tool execution results to ensure:
+1. Results have expected structure
+2. Data is present and valid
+3. Error conditions are properly identified
+4. Tool-specific validations pass
+
+Architecture Position:
+    Tool Executor → ToolResultValidator → Synthesis Layer (or Error Handler)
+
+Integration:
+- Called after tool execution in agent.py
+- Results are validated before being passed to summarize_mcp_result
+- Invalid results are caught early with clear error messages
+
+Usage:
+    from agents.pm_agent.result_validator import ToolResultValidator, ValidationResult
+    
+    validator = ToolResultValidator()
+    result = validator.validate("execute_wiql", tool_result)
+    
+    if not result.is_valid:
+        # Handle error - don't proceed to synthesis
+        return _make_agent_response(content=result.error_message, status="FAILED")
+    
+    # Use sanitized result for synthesis
+    synthesized = await summarize_mcp_result(query, result.sanitized_result, ...)
+"""
+
+import json
+import logging
+import re
+from typing import Dict, Any, Optional, List, Callable
+from dataclasses import dataclass, field
+from enum import Enum
+
+logger = logging.getLogger("agents.pm_agent.result_validator")
+
+
+class ValidationSeverity(Enum):
+    """Severity levels for validation issues."""
+    ERROR = "error"      # Must not proceed (invalid result)
+    WARNING = "warning"  # Can proceed but data may be incomplete
+    INFO = "info"        # Informational (empty results, etc.)
+
+
+@dataclass
+class ValidationIssue:
+    """Single validation issue found in result."""
+    severity: ValidationSeverity
+    code: str
+    message: str
+    field: Optional[str] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "severity": self.severity.value,
+            "code": self.code,
+            "message": self.message,
+            "field": self.field
+        }
+
+
+@dataclass
+class ValidationResult:
+    """Result of tool execution validation."""
+    is_valid: bool
+    tool_name: str
+    errors: List[ValidationIssue] = field(default_factory=list)
+    warnings: List[ValidationIssue] = field(default_factory=list)
+    info: List[ValidationIssue] = field(default_factory=list)
+    sanitized_result: Optional[Dict[str, Any]] = None
+    
+    @property
+    def error_message(self) -> Optional[str]:
+        """Get combined error message for display."""
+        if not self.errors:
+            return None
+        return "; ".join(e.message for e in self.errors)
+    
+    @property
+    def warning_messages(self) -> List[str]:
+        """Get list of warning messages."""
+        return [w.message for w in self.warnings]
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "is_valid": self.is_valid,
+            "tool_name": self.tool_name,
+            "errors": [e.to_dict() for e in self.errors],
+            "warnings": [w.to_dict() for w in self.warnings],
+            "info": [i.to_dict() for i in self.info],
+            "error_message": self.error_message
+        }
+
+
+class ToolResultValidator:
+    """
+    Validates tool execution results before synthesis.
+    
+    Performs:
+    1. Structure validation (has required fields)
+    2. Data presence validation (not empty)
+    3. Error flag detection (success=false, error messages)
+    4. Tool-specific validations
+    5. Data type validation
+    
+    Thread-safe and stateless.
+    """
+    
+    # Tools that MUST return 'items' list
+    ITEM_LIST_TOOLS = {
+        "execute_wiql",
+        "wit_get_work_items_for_iteration",
+        "work_get_iteration_work_items",
+        "search_workitem",
+        "wit_get_work_items",
+        "pr_list_pull_requests",
+        "repo_list_repos_by_project",
+        "core_list_projects",
+        "core_list_project_teams",
+        "work_list_iterations",
+        "work_list_team_iterations",
+        # PR/Repository tools
+        "repo_list_pull_requests_by_repo_or_project",
+        "repo_list_branches_by_repo",
+        "repo_search_commits",
+        # Test plan tools
+        "testplan_list_test_plans",
+        "testplan_list_test_suites",
+        "testplan_list_test_cases",
+        # Wiki tools
+        "wiki_list_wikis",
+        "wiki_list_pages",
+        # Security tools
+        "advsec_get_alerts",
+    }
+    
+    # Tools that return single objects (not lists)
+    SINGLE_OBJECT_TOOLS = {
+        "wit_get_work_item",
+        "pr_get_pull_request",
+        "repo_get_pull_request_by_id",
+        "core_get_project",
+    }
+    
+    # Tools that may return empty results legitimately
+    ALLOW_EMPTY_TOOLS = {
+        "execute_wiql",  # Query may match nothing
+        "search_workitem",     # Search may find nothing
+        "advsec_get_alerts",   # No security alerts is valid
+    }
+    
+    # Field presence requirements per tool
+    REQUIRED_FIELDS = {
+        "execute_wiql": ["workItems"],
+        "wit_get_work_item": ["id", "fields"],
+        "search_workitem": ["results"],
+    }
+    
+    # PR/Repository tools that return lists
+    PR_REPO_LIST_TOOLS = {
+        "repo_list_pull_requests_by_repo_or_project",
+        "repo_list_branches_by_repo",
+        "repo_list_repos_by_project",
+        "repo_search_commits",
+    }
+    
+    def __init__(self):
+        """Initialize the validator."""
+        # Tool-specific validators (generic - not tied to specific queries)
+        self._tool_validators: Dict[str, Callable] = {
+            "execute_wiql": self._validate_wiql_result,
+            "wit_get_work_items_for_iteration": self._validate_iteration_result,
+            "search_workitem": self._validate_search_result,
+            "wit_get_work_item": self._validate_single_workitem,
+            "wit_get_work_items": self._validate_workitems_batch,
+            # PR/Repo validators
+            "repo_list_pull_requests_by_repo_or_project": self._validate_pr_list_result,
+            "repo_get_pull_request_by_id": self._validate_single_pr,
+            "repo_list_branches_by_repo": self._validate_branch_list_result,
+        }
+    
+    def validate(self, tool_name: str, result: Any, query: str = None, plan: dict = None) -> ValidationResult:
+        """
+        Validate a tool execution result.
+        
+        Args:
+            tool_name: Name of the tool that was executed
+            result: Raw result from tool execution
+            query: Original user query for intent-aware validation (optional)
+            plan: The plan that was executed, for cross-referencing (optional)
+            
+        Returns:
+            ValidationResult with is_valid flag and any issues found
+        """
+        validation = ValidationResult(is_valid=True, tool_name=tool_name)
+        
+        try:
+            # ═══════════════════════════════════════════════════════════════
+            # STEP 1: Basic type validation
+            # ═══════════════════════════════════════════════════════════════
+            if result is None:
+                validation.errors.append(ValidationIssue(
+                    severity=ValidationSeverity.ERROR,
+                    code="NULL_RESULT",
+                    message=f"Tool '{tool_name}' returned null/None result"
+                ))
+                validation.is_valid = False
+                return validation
+            
+            # Handle string results (may be JSON)
+            if isinstance(result, str):
+                result = self._parse_string_result(result, validation)
+                if not validation.is_valid:
+                    return validation
+            
+            # Must be dict at this point
+            if not isinstance(result, dict):
+                # Handle list results (some tools return arrays directly)
+                if isinstance(result, list):
+                    result = {"items": result, "count": len(result), "success": True}
+                else:
+                    validation.errors.append(ValidationIssue(
+                        severity=ValidationSeverity.ERROR,
+                        code="INVALID_TYPE",
+                        message=f"Expected dict, got {type(result).__name__}"
+                    ))
+                    validation.is_valid = False
+                    return validation
+            
+            # ═══════════════════════════════════════════════════════════════
+            # STEP 2: Check success flag
+            # ═══════════════════════════════════════════════════════════════
+            success = result.get("success")
+            
+            # Explicit failure
+            if success is False:
+                error_msg = result.get("error") or result.get("message") or "Unknown error"
+                validation.errors.append(ValidationIssue(
+                    severity=ValidationSeverity.ERROR,
+                    code="TOOL_FAILED",
+                    message=f"Tool execution failed: {error_msg}"
+                ))
+                validation.is_valid = False
+                return validation
+            
+            # Check for error field without success=false
+            if "error" in result and result.get("error"):
+                error_msg = result["error"]
+                # Some tools include error field even on partial success
+                if success is True:
+                    validation.warnings.append(ValidationIssue(
+                        severity=ValidationSeverity.WARNING,
+                        code="PARTIAL_ERROR",
+                        message=f"Partial error: {error_msg}",
+                        field="error"
+                    ))
+                else:
+                    validation.errors.append(ValidationIssue(
+                        severity=ValidationSeverity.ERROR,
+                        code="ERROR_FIELD",
+                        message=f"Error in result: {error_msg}",
+                        field="error"
+                    ))
+                    validation.is_valid = False
+                    return validation
+            
+            # ═══════════════════════════════════════════════════════════════
+            # STEP 3: Data presence validation
+            # ═══════════════════════════════════════════════════════════════
+            if tool_name in self.ITEM_LIST_TOOLS:
+                items = self._extract_items(result)
+                
+                if items is None:
+                    validation.errors.append(ValidationIssue(
+                        severity=ValidationSeverity.ERROR,
+                        code="MISSING_ITEMS",
+                        message=f"Tool '{tool_name}' expected to return items but none found"
+                    ))
+                    validation.is_valid = False
+                    return validation
+                
+                if len(items) == 0:
+                    if tool_name in self.ALLOW_EMPTY_TOOLS:
+                        validation.info.append(ValidationIssue(
+                            severity=ValidationSeverity.INFO,
+                            code="EMPTY_RESULTS",
+                            message="Query returned no matching items"
+                        ))
+                    else:
+                        validation.warnings.append(ValidationIssue(
+                            severity=ValidationSeverity.WARNING,
+                            code="EMPTY_RESULTS",
+                            message=f"Tool '{tool_name}' returned empty results"
+                        ))
+                
+                # Normalize result to have 'items' field
+                result["items"] = items
+                result["count"] = len(items)
+            
+            # ═══════════════════════════════════════════════════════════════
+            # STEP 4: Required fields validation
+            # ═══════════════════════════════════════════════════════════════
+            required = self.REQUIRED_FIELDS.get(tool_name, [])
+            for field in required:
+                if field not in result or result[field] is None:
+                    # Check alternative locations
+                    if not self._find_field_alternative(result, field):
+                        validation.warnings.append(ValidationIssue(
+                            severity=ValidationSeverity.WARNING,
+                            code="MISSING_FIELD",
+                            message=f"Expected field '{field}' not found",
+                            field=field
+                        ))
+            
+            # ═══════════════════════════════════════════════════════════════
+            # STEP 5: Tool-specific validation
+            # ═══════════════════════════════════════════════════════════════
+            tool_validator = self._tool_validators.get(tool_name)
+            if tool_validator:
+                tool_validator(result, validation)
+            
+            # ═══════════════════════════════════════════════════════════════
+            # STEP 5b: Intent-Aware Result Validation
+            # If query is provided, check if the result makes sense for the query.
+            # ═══════════════════════════════════════════════════════════════
+            if query:
+                self._validate_intent_relevance(tool_name, result, query, plan, validation)
+            
+            # ═══════════════════════════════════════════════════════════════
+            # STEP 6: Detect planner JSON in result (CRITICAL)
+            # ═══════════════════════════════════════════════════════════════
+            if self._looks_like_planner_json(result):
+                validation.errors.append(ValidationIssue(
+                    severity=ValidationSeverity.ERROR,
+                    code="PLANNER_JSON_LEAK",
+                    message="Result contains planner JSON instead of tool output (critical error)"
+                ))
+                validation.is_valid = False
+                return validation
+            
+            # Store sanitized result
+            validation.sanitized_result = result
+            
+            # Log validation summary
+            if validation.errors:
+                logger.warning(f"[VALIDATOR] {tool_name}: {len(validation.errors)} errors, "
+                              f"{len(validation.warnings)} warnings")
+            elif validation.warnings:
+                logger.info(f"[VALIDATOR] {tool_name}: {len(validation.warnings)} warnings")
+            else:
+                logger.debug(f"[VALIDATOR] {tool_name}: validation passed")
+            
+        except Exception as e:
+            validation.errors.append(ValidationIssue(
+                severity=ValidationSeverity.ERROR,
+                code="VALIDATION_EXCEPTION",
+                message=f"Validation failed with exception: {str(e)}"
+            ))
+            validation.is_valid = False
+            logger.exception(f"[VALIDATOR] Exception validating {tool_name}: {e}")
+        
+        return validation
+    
+    def _parse_string_result(self, result: str, validation: ValidationResult) -> Optional[Dict]:
+        """Parse string result as JSON."""
+        if not result or result.strip() == "":
+            validation.errors.append(ValidationIssue(
+                severity=ValidationSeverity.ERROR,
+                code="EMPTY_STRING",
+                message="Tool returned empty string"
+            ))
+            validation.is_valid = False
+            return None
+        
+        if result.strip().lower() in ("null", "none", "no results", "no iterations found"):
+            validation.info.append(ValidationIssue(
+                severity=ValidationSeverity.INFO,
+                code="NULL_STRING",
+                message="Tool returned 'null' or 'no results' string"
+            ))
+            return {"items": [], "count": 0, "success": True}
+        
+        try:
+            parsed = json.loads(result)
+            return parsed
+        except json.JSONDecodeError as e:
+            # Result is not JSON - might be error message or raw text
+            if "error" in result.lower() or "failed" in result.lower():
+                validation.errors.append(ValidationIssue(
+                    severity=ValidationSeverity.ERROR,
+                    code="ERROR_STRING",
+                    message=f"Tool returned error: {result[:200]}"
+                ))
+                validation.is_valid = False
+            else:
+                # Treat as raw text result
+                validation.info.append(ValidationIssue(
+                    severity=ValidationSeverity.INFO,
+                    code="RAW_TEXT",
+                    message="Tool returned non-JSON text"
+                ))
+                return {"raw_text": result, "success": True}
+            return None
+    
+    def _extract_items(self, result: Dict) -> Optional[List]:
+        """Extract items list from result (handles various structures)."""
+        # Direct items field
+        if "items" in result and isinstance(result["items"], list):
+            return result["items"]
+        
+        # WIQL results
+        if "workItems" in result and isinstance(result["workItems"], list):
+            return result["workItems"]
+        
+        # Search results
+        if "results" in result and isinstance(result["results"], list):
+            return result["results"]
+        
+        # ADO API 'value' pattern
+        if "value" in result and isinstance(result["value"], list):
+            return result["value"]
+        
+        # Work items for iteration
+        if "work_items" in result and isinstance(result["work_items"], list):
+            return result["work_items"]
+        
+        # Iteration list
+        if "iterations" in result and isinstance(result["iterations"], list):
+            return result["iterations"]
+        
+        return None
+    
+    def _find_field_alternative(self, result: Dict, field: str) -> bool:
+        """Check if field exists under alternative name."""
+        alternatives = {
+            "workItems": ["items", "work_items", "value"],
+            "items": ["workItems", "results", "value"],
+            "results": ["items", "workItems"],
+        }
+        
+        for alt in alternatives.get(field, []):
+            if alt in result and result[alt] is not None:
+                return True
+        return False
+    
+    def _looks_like_planner_json(self, result: Dict) -> bool:
+        """Detect if result is actually planner JSON (not tool output)."""
+        planner_signatures = ["action", "tool", "args", "confidence"]
+        matches = sum(1 for sig in planner_signatures if sig in result)
+        
+        # If 3+ planner fields present, this is likely planner JSON
+        if matches >= 3:
+            return True
+        
+        # Explicit action field with tool field
+        if "action" in result and "tool" in result:
+            return True
+        
+        return False
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # INTENT-AWARE RESULT VALIDATION
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    def _validate_intent_relevance(
+        self, tool_name: str, result: Dict, query: str, plan: dict, validation: ValidationResult
+    ) -> None:
+        """
+        Validate that tool results are relevant to the user's query intent.
+        
+        This performs lightweight checks:
+        1. Empty result awareness: Is an empty result expected or suspicious?
+        2. Data coverage: Do result items match the expected type/state from query?
+        3. analysis_criteria satisfaction: Was the plan's filter_logic addressed?
+        
+        Produces warnings (never errors) — the synthesizer may still handle
+        results correctly even if this check flags mismatches.
+        
+        Args:
+            tool_name: Name of the executed tool
+            result: Parsed result dict
+            query: Original user query
+            plan: The plan that was executed
+            validation: ValidationResult to append issues to
+        """
+        try:
+            from agents.pm_agent.query_aware_filter import analyze_query_intent
+        except ImportError:
+            return
+        
+        intent = analyze_query_intent(query)
+        items = self._extract_items(result)
+        
+        # ── Check 1: Intent-aware empty result assessment ──
+        if items is not None and len(items) == 0:
+            if intent.has_active_filters():
+                # User has specific filters — empty may be legitimate
+                validation.info.append(ValidationIssue(
+                    severity=ValidationSeverity.INFO,
+                    code="EMPTY_RESULT_WITH_FILTERS",
+                    message=(
+                        f"No items returned, but query has active filters "
+                        f"(blocked={intent.filter_blocked}, at_risk={intent.filter_at_risk}, "
+                        f"unassigned={intent.filter_unassigned}). "
+                        f"This may be a valid 'nothing matches' result."
+                    )
+                ))
+            elif tool_name not in self.ALLOW_EMPTY_TOOLS:
+                # Generic query with no filters returning empty — suspicious
+                validation.warnings.append(ValidationIssue(
+                    severity=ValidationSeverity.WARNING,
+                    code="UNEXPECTED_EMPTY_RESULT",
+                    message=(
+                        f"Tool '{tool_name}' returned empty results for a query "
+                        f"without specific filters. This may indicate a tool argument issue."
+                    )
+                ))
+        
+        # ── Check 2: Work item type coverage ──
+        if items and intent.filter_by_types:
+            expected_types = set(t.lower() for t in intent.filter_by_types)
+            actual_types = set()
+            for item in items[:50]:  # Sample first 50
+                if isinstance(item, dict):
+                    fields = item.get("fields", {})
+                    wit = fields.get("System.WorkItemType", "")
+                    if wit:
+                        actual_types.add(wit.lower())
+            
+            if actual_types and not actual_types.intersection(expected_types):
+                validation.warnings.append(ValidationIssue(
+                    severity=ValidationSeverity.WARNING,
+                    code="TYPE_MISMATCH",
+                    message=(
+                        f"Query expects types {intent.filter_by_types} but result "
+                        f"contains types {list(actual_types)}"
+                    )
+                ))
+        
+        # ── Check 3: analysis_criteria filter_logic satisfaction ──
+        if plan and items:
+            analysis_criteria = plan.get("analysis_criteria", {})
+            filter_logic = analysis_criteria.get("filter_logic", "")
+            ac_intent = analysis_criteria.get("intent", "")
+            
+            if ac_intent in ("blocked", "at-risk") and len(items) > 0:
+                # If plan says we're looking for blocked/at-risk items,
+                # check if result items actually look relevant
+                # (simple heuristic: at least some items should have matching indicators)
+                sample_size = min(len(items), 20)
+                has_indicators = False
+                for item in items[:sample_size]:
+                    if isinstance(item, dict):
+                        fields = item.get("fields", {})
+                        state = (fields.get("System.State", "") or "").lower()
+                        tags = (fields.get("System.Tags", "") or "").lower()
+                        
+                        if ac_intent == "blocked" and ("blocked" in tags or "on hold" in state or "impediment" in tags):
+                            has_indicators = True
+                            break
+                        if ac_intent == "at-risk" and (state not in ("closed", "resolved", "completed", "done")):
+                            has_indicators = True
+                            break
+                
+                if not has_indicators and sample_size > 0:
+                    validation.info.append(ValidationIssue(
+                        severity=ValidationSeverity.INFO,
+                        code="CRITERIA_COVERAGE_LOW",
+                        message=(
+                            f"analysis_criteria intent='{ac_intent}' but sampled items "
+                            f"show limited matching indicators. Post-filtering may be needed."
+                        )
+                    ))
+        
+        # ── Check 4: Area Path / Scope Coherence ──
+        # If the query mentions a specific team/area scope, verify that
+        # returned items' AreaPath fields match that scope.
+        if items:
+            scope_name = self._detect_scope_from_query(query)
+            if scope_name:
+                scope_lower = scope_name.lower()
+                matching = 0
+                checked = 0
+                mismatched_areas = set()
+                for item in items[:50]:  # Sample up to 50 items
+                    if isinstance(item, dict):
+                        fields = item.get("fields", {})
+                        area_path = (fields.get("System.AreaPath", "") or "").lower()
+                        if area_path:
+                            checked += 1
+                            if scope_lower in area_path:
+                                matching += 1
+                            else:
+                                # Collect top-level area for reporting
+                                parts = area_path.split("\\")
+                                mismatched_areas.add(parts[-1] if len(parts) > 1 else area_path)
+
+                if checked > 0 and matching == 0:
+                    # NONE of the items match the expected scope — strong signal
+                    validation.warnings.append(ValidationIssue(
+                        severity=ValidationSeverity.WARNING,
+                        code="SCOPE_MISMATCH",
+                        message=(
+                            f"Query asks for '{scope_name}' but none of the {checked} "
+                            f"sampled items have a matching AreaPath. Results may be from "
+                            f"the wrong team/area. Found areas: "
+                            f"{list(mismatched_areas)[:5]}"
+                        )
+                    ))
+                elif checked > 0 and matching < checked * 0.5:
+                    # Less than half match — partial scope leakage
+                    pct = round(matching / checked * 100)
+                    validation.warnings.append(ValidationIssue(
+                        severity=ValidationSeverity.WARNING,
+                        code="SCOPE_LEAKAGE",
+                        message=(
+                            f"Query asks for '{scope_name}' but only {pct}% of "
+                            f"sampled items have a matching AreaPath. Results may "
+                            f"include items from other teams/areas."
+                        )
+                    ))
+        
+        # ── Check 5: Date Range Coherence ──
+        # If the query mentions a time constraint, check returned items' dates.
+        if items:
+            import re
+            from datetime import datetime, timedelta
+            date_range_match = re.search(
+                r'\b(?:last|past)\s+(\d+)\s+days?\b', query.lower()
+            )
+            if date_range_match:
+                days_back = int(date_range_match.group(1))
+                cutoff = datetime.utcnow() - timedelta(days=days_back + 1)  # +1 buffer
+                out_of_range = 0
+                checked_dates = 0
+                for item in items[:30]:
+                    if isinstance(item, dict):
+                        fields = item.get("fields", {})
+                        created = fields.get("System.CreatedDate", "")
+                        if created:
+                            try:
+                                if isinstance(created, str):
+                                    dt = datetime.fromisoformat(
+                                        created.replace("Z", "+00:00")
+                                    ).replace(tzinfo=None)
+                                    checked_dates += 1
+                                    if dt < cutoff:
+                                        out_of_range += 1
+                            except (ValueError, TypeError):
+                                pass
+                if checked_dates > 0 and out_of_range > checked_dates * 0.5:
+                    pct = round(out_of_range / checked_dates * 100)
+                    validation.warnings.append(ValidationIssue(
+                        severity=ValidationSeverity.WARNING,
+                        code="DATE_RANGE_MISMATCH",
+                        message=(
+                            f"Query asks for items from the last {days_back} days but "
+                            f"{pct}% of sampled items were created outside that range."
+                        )
+                    ))
+        
+        logger.debug(f"[VALIDATOR] Intent relevance check complete for {tool_name}")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SCOPE DETECTION HELPER
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _detect_scope_from_query(query: str) -> str:
+        """
+        Detect if a query specifies a team/area scope.
+
+        Returns the scope name or empty string.  Mirrors the same logic used
+        by the plan validator so both sides are consistent.
+
+        Examples:
+          'Find bugs for FracPro Suite'     → 'FracPro Suite'
+          'items in XOPS 25 area'           → 'XOPS 25'
+          'show all bugs'                   → ''
+        """
+        import re
+
+        _SKIP = {
+            "the", "this", "that", "all", "my", "our", "some", "any", "each",
+            "current", "last", "next", "previous", "active", "new", "open",
+            "every", "a", "an",
+        }
+
+        # Pattern 1: "for <ProperNoun+>"
+        m = re.search(
+            r'\bfor\s+'
+            r'((?:[A-Z][A-Za-z0-9]*(?:\s+(?:[A-Z0-9][A-Za-z0-9]*|\d+))*))',
+            query
+        )
+        if m:
+            candidate = m.group(1).strip()
+            if candidate.split()[0].lower() not in _SKIP:
+                return candidate
+
+        # Pattern 2: "in <ProperNoun+> team/area"
+        m = re.search(
+            r'\bin\s+'
+            r'((?:[A-Z][A-Za-z0-9]*(?:\s+(?:[A-Z0-9][A-Za-z0-9]*|\d+))*))',
+            query
+        )
+        if m:
+            candidate = m.group(1).strip()
+            if candidate.split()[0].lower() not in _SKIP:
+                return candidate
+
+        return ""
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TOOL-SPECIFIC VALIDATORS
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    def _validate_wiql_result(self, result: Dict, validation: ValidationResult) -> None:
+        """Validate WIQL query result."""
+        items = self._extract_items(result)
+        if items:
+            for idx, item in enumerate(items[:5]):  # Check first 5 items
+                if isinstance(item, dict):
+                    if "id" not in item and "System.Id" not in item.get("fields", {}):
+                        validation.warnings.append(ValidationIssue(
+                            severity=ValidationSeverity.WARNING,
+                            code="MISSING_ITEM_ID",
+                            message=f"Work item at index {idx} has no ID",
+                            field=f"items[{idx}]"
+                        ))
+    
+    def _validate_iteration_result(self, result: Dict, validation: ValidationResult) -> None:
+        """Validate iteration work items result."""
+        items = self._extract_items(result)
+        
+        # Check for resolved iteration info
+        if "_resolved_from_macro" in result:
+            validation.info.append(ValidationIssue(
+                severity=ValidationSeverity.INFO,
+                code="MACRO_RESOLVED",
+                message=f"Iteration macro resolved: {result['_resolved_from_macro']}"
+            ))
+    
+    def _validate_search_result(self, result: Dict, validation: ValidationResult) -> None:
+        """Validate search result."""
+        results = result.get("results", [])
+        
+        # Check for facets if requested
+        if result.get("includeFacets") and "facets" not in result:
+            validation.warnings.append(ValidationIssue(
+                severity=ValidationSeverity.WARNING,
+                code="MISSING_FACETS",
+                message="Facets were requested but not returned",
+                field="facets"
+            ))
+    
+    def _validate_single_workitem(self, result: Dict, validation: ValidationResult) -> None:
+        """
+        Validate single work item result.
+        
+        Handles multiple response structures:
+        1. Direct: {"id": 123, "fields": {...}}
+        2. Wrapped: {"tool": "...", "items": [{"id": 123, "fields": {...}}], "raw": {...}}
+        3. Raw: {"tool": "...", "raw": {"id": 123, "fields": {...}}}
+        """
+        # ══════════════════════════════════════════════════════════════════
+        # FIX #6: Work Item ID Normalization
+        # The ToolExecutor wraps responses, so ID may be in multiple locations
+        # ══════════════════════════════════════════════════════════════════
+        work_item_id = None
+        work_item_fields = None
+        
+        # Strategy 1: Direct ID at top level
+        if "id" in result:
+            work_item_id = result["id"]
+            work_item_fields = result.get("fields")
+        
+        # Strategy 2: Check inside "items" array (ToolExecutor wrapping)
+        if not work_item_id and "items" in result:
+            items = result.get("items", [])
+            if items and isinstance(items, list) and len(items) > 0:
+                first_item = items[0]
+                if isinstance(first_item, dict):
+                    work_item_id = first_item.get("id")
+                    work_item_fields = first_item.get("fields")
+        
+        # Strategy 3: Check inside "raw" response (ToolExecutor wrapping)
+        if not work_item_id and "raw" in result:
+            raw = result.get("raw")
+            if isinstance(raw, dict):
+                work_item_id = raw.get("id")
+                work_item_fields = raw.get("fields")
+        
+        # Strategy 4: Check "value" (Azure DevOps API response format)
+        if not work_item_id and "value" in result:
+            value = result.get("value")
+            if isinstance(value, dict):
+                work_item_id = value.get("id")
+                work_item_fields = value.get("fields")
+            elif isinstance(value, list) and len(value) > 0:
+                first_item = value[0]
+                if isinstance(first_item, dict):
+                    work_item_id = first_item.get("id")
+                    work_item_fields = first_item.get("fields")
+        
+        # Validate: ID must exist
+        if not work_item_id:
+            validation.errors.append(ValidationIssue(
+                severity=ValidationSeverity.ERROR,
+                code="MISSING_WORKITEM_ID",
+                message="Work item result has no ID in any expected location (top-level, items[0], raw, or value)",
+                field="id"
+            ))
+            validation.is_valid = False
+        else:
+            # Log successful extraction for debugging
+            validation.info.append(ValidationIssue(
+                severity=ValidationSeverity.INFO,
+                code="ID_FOUND",
+                message=f"Work item ID {work_item_id} found",
+                field="id"
+            ))
+        
+        # Validate: Fields should exist (warning, not error)
+        if not work_item_fields:
+            validation.warnings.append(ValidationIssue(
+                severity=ValidationSeverity.WARNING,
+                code="MISSING_FIELDS",
+                message="Work item has no fields",
+                field="fields"
+            ))
+    
+    def _validate_workitems_batch(self, result: Dict, validation: ValidationResult) -> None:
+        """Validate batch work items result."""
+        items = self._extract_items(result)
+        if items:
+            # Check all items have IDs
+            missing_ids = [i for i, item in enumerate(items) if isinstance(item, dict) and "id" not in item]
+            if missing_ids:
+                validation.warnings.append(ValidationIssue(
+                    severity=ValidationSeverity.WARNING,
+                    code="ITEMS_MISSING_IDS",
+                    message=f"{len(missing_ids)} items missing IDs"
+                ))
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PR/REPOSITORY VALIDATORS (Generic - not tied to specific queries)
+    # ═══════════════════════════════════════════════════════════════════════════
+    
+    def _validate_pr_list_result(self, result: Dict, validation: ValidationResult) -> None:
+        """
+        Validate pull request list result.
+        
+        Checks that PR items have pullRequestId field which is required for
+        proper ID extraction in the synthesizer.
+        """
+        items = self._extract_items(result)
+        if items:
+            # Check first few items for pullRequestId
+            prs_missing_id = []
+            for idx, item in enumerate(items[:10]):  # Check first 10
+                if isinstance(item, dict):
+                    # PR ID can be in pullRequestId or codeReviewId
+                    pr_id = item.get("pullRequestId") or item.get("codeReviewId")
+                    if not pr_id:
+                        prs_missing_id.append(idx)
+            
+            if prs_missing_id:
+                validation.warnings.append(ValidationIssue(
+                    severity=ValidationSeverity.WARNING,
+                    code="PR_MISSING_ID",
+                    message=f"{len(prs_missing_id)} PRs missing pullRequestId in first 10 items",
+                    field="pullRequestId"
+                ))
+            else:
+                validation.info.append(ValidationIssue(
+                    severity=ValidationSeverity.INFO,
+                    code="PR_IDS_VALID",
+                    message="All checked PRs have valid pullRequestId"
+                ))
+    
+    def _validate_single_pr(self, result: Dict, validation: ValidationResult) -> None:
+        """
+        Validate single pull request result.
+        
+        Handles multiple response structures:
+        1. Direct: {"pullRequestId": 123, "title": "..."}
+        2. Wrapped: {"items": [{"pullRequestId": 123, ...}]}
+        """
+        pr_id = None
+        
+        # Strategy 1: Direct pullRequestId at top level
+        if "pullRequestId" in result:
+            pr_id = result["pullRequestId"]
+        
+        # Strategy 2: Check inside "items" array
+        if not pr_id and "items" in result:
+            items = result.get("items", [])
+            if items and isinstance(items, list) and len(items) > 0:
+                first_item = items[0]
+                if isinstance(first_item, dict):
+                    pr_id = first_item.get("pullRequestId") or first_item.get("codeReviewId")
+        
+        # Strategy 3: Check "raw" response
+        if not pr_id and "raw" in result:
+            raw = result.get("raw")
+            if isinstance(raw, dict):
+                pr_id = raw.get("pullRequestId") or raw.get("codeReviewId")
+        
+        if not pr_id:
+            validation.errors.append(ValidationIssue(
+                severity=ValidationSeverity.ERROR,
+                code="MISSING_PR_ID",
+                message="Pull request result has no pullRequestId",
+                field="pullRequestId"
+            ))
+            validation.is_valid = False
+        else:
+            validation.info.append(ValidationIssue(
+                severity=ValidationSeverity.INFO,
+                code="PR_ID_FOUND",
+                message=f"PR ID {pr_id} found",
+                field="pullRequestId"
+            ))
+    
+    def _validate_branch_list_result(self, result: Dict, validation: ValidationResult) -> None:
+        """
+        Validate branch list result.
+        
+        Checks that branch items have name field.
+        """
+        items = self._extract_items(result)
+        if items:
+            # Check first few items for name
+            branches_missing_name = []
+            for idx, item in enumerate(items[:10]):  # Check first 10
+                if isinstance(item, dict):
+                    branch_name = item.get("name")
+                    if not branch_name:
+                        branches_missing_name.append(idx)
+            
+            if branches_missing_name:
+                validation.warnings.append(ValidationIssue(
+                    severity=ValidationSeverity.WARNING,
+                    code="BRANCH_MISSING_NAME",
+                    message=f"{len(branches_missing_name)} branches missing name in first 10 items",
+                    field="name"
+                ))
+
+
+# Singleton instance for convenience
+_validator: Optional[ToolResultValidator] = None
+
+
+def get_result_validator() -> ToolResultValidator:
+    """Get singleton validator instance."""
+    global _validator
+    if _validator is None:
+        _validator = ToolResultValidator()
+    return _validator
+
+
+def validate_tool_result(tool_name: str, result: Any, query: str = None, plan: dict = None) -> ValidationResult:
+    """Convenience function to validate a tool result."""
+    return get_result_validator().validate(tool_name, result, query=query, plan=plan)
