@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="220" viewBox="0 0 900 220">
+  <style>
+    .box { fill:#f8fafc; stroke:#0f172a; stroke-width:1.5; rx:8; }
+    .title { font: bold 13px/1.2 sans-serif; fill:#0f172a; }
+    .label { font: 12px/1.2 sans-serif; fill:#0f172a; }
+    .arrow { stroke:#0f172a; stroke-width:1.6; fill:none; marker-end:url(#a); }
+  </style>
+  <defs>
+    <marker id="a" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#0f172a" />
+    </marker>
+  </defs>
+
+  <rect x="20" y="40" width="140" height="60" class="box" />
+  <text x="90" y="78" text-anchor="middle" class="title">User</text>
+
+  <rect x="190" y="30" width="160" height="80" class="box" />
+  <text x="270" y="60" text-anchor="middle" class="title">Streamlit UI / CLI</text>
+
+  <rect x="380" y="30" width="160" height="80" class="box" />
+  <text x="460" y="60" text-anchor="middle" class="title">Orchestrator</text>
+
+  <rect x="570" y="12" width="160" height="100" class="box" />
+  <text x="650" y="42" text-anchor="middle" class="title">PM Agent</text>
+
+  <rect x="760" y="12" width="120" height="100" class="box" />
+  <text x="820" y="42" text-anchor="middle" class="title">External
+Systems</text>
+  <text x="820" y="62" text-anchor="middle" class="label">Azure DevOps / VectorDB</text>
+
+  <path d="M160 70 L190 70" class="arrow" />
+  <path d="M350 70 L380 70" class="arrow" />
+  <path d="M540 70 L570 70" class="arrow" />
+  <path d="M730 70 L760 70" class="arrow" />
+
+  <text x="460" y="95" text-anchor="middle" class="label">routing · policy · fallback</text>
+</svg>

@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="620" viewBox="0 0 1000 620">
+  <style>
+    .box { fill:#f3f6fb; stroke:#294956; stroke-width:2; rx:8; }
+    .svc { fill:#fff7ed; stroke:#b96a2e; stroke-width:2; rx:6; }
+    .agent { fill:#f0fdf4; stroke:#166534; stroke-width:2; rx:6; }
+    .text { font:14px sans-serif; fill:#0b1221; }
+    .title { font:16px sans-serif; font-weight:700; fill:#0b1221; }
+    .arrow { stroke:#2b2f33; stroke-width:2; fill:none; marker-end:url(#a); }
+  </style>
+  <defs>
+    <marker id="a" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2b2f33" />
+    </marker>
+  </defs>
+
+  <!-- UI -->
+  <rect class="box" x="40" y="30" width="200" height="70"/>
+  <text x="140" y="70" text-anchor="middle" class="title">Streamlit UI</text>
+  <text x="140" y="88" text-anchor="middle" class="text">(web dashboard & chat)</text>
+
+  <!-- Orchestrator -->
+  <rect class="box" x="300" y="30" width="250" height="90"/>
+  <text x="425" y="55" text-anchor="middle" class="title">Orchestrator / Router</text>
+  <text x="425" y="75" text-anchor="middle" class="text">routing • context • tool dispatch</text>
+
+  <!-- Langfuse/LLM -->
+  <rect class="svc" x="780" y="30" width="180" height="70"/>
+  <text x="870" y="58" text-anchor="middle" class="title">LLMs & Langfuse</text>
+  <text x="870" y="76" text-anchor="middle" class="text">model calls & tracing</text>
+
+  <!-- PM Agent & Skill Agents -->
+  <rect class="agent" x="300" y="150" width="250" height="70"/>
+  <text x="425" y="190" text-anchor="middle" class="title">PM Agent</text>
+  <text x="425" y="208" text-anchor="middle" class="text">planning • synthesis • validation</text>
+
+  <rect class="box" x="300" y="250" width="250" height="110"/>
+  <text x="425" y="275" text-anchor="middle" class="title">Skill Agents</text>
+  <text x="425" y="295" text-anchor="middle" class="text">wiql, backlog, capacity, reporting</text>
+
+  <!-- Azure DevOps -->
+  <rect class="box" x="760" y="250" width="230" height="110"/>
+  <text x="875" y="280" text-anchor="middle" class="title">Azure DevOps (MCP / REST)</text>
+  <text x="875" y="300" text-anchor="middle" class="text">work items • iterations • capacities</text>
+
+  <!-- Vector DB -->
+  <rect class="box" x="780" y="420" width="180" height="70"/>
+  <text x="870" y="455" text-anchor="middle" class="title">Vector DB / Embeddings</text>
+  <text x="870" y="473" text-anchor="middle" class="text">search • memory • KB</text>
+
+  <!-- Arrows -->
+  <path class="arrow" d="M240,65 L300,65"/>
+  <path class="arrow" d="M550,65 L780,65"/>
+
+  <path class="arrow" d="M425,120 L425,150"/>
+  <path class="arrow" d="M425,220 L425,250"/>
+
+  <path class="arrow" d="M550,190 L760,190 L760,285"/>
+  <path class="arrow" d="M550,320 L760,320"/>
+
+  <path class="arrow" d="M550,320 L780,455"/>
+  <path class="arrow" d="M925,320 L925,420"/>
+
+  <!-- Labels for flows -->
+  <text x="275" y="55" class="text">user requests</text>
+  <text x="665" y="55" class="text">model + trace</text>
+  <text x="540" y="175" class="text">dispatch</text>
+  <text x="540" y="265" class="text">skill invocation</text>
+  <text x="665" y="360" class="text">ADO queries</text>
+  <text x="840" y="370" class="text">kb / embeddings</text>
+
+  <text x="500" y="600" text-anchor="middle" class="text">High-level architecture of pm-agent: UI → Orchestrator → Agents → Tools/KB/LLM</text>
+</svg>
